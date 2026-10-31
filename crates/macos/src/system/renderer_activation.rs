@@ -27,7 +27,8 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
     if current == Some(true) {
         return Ok(());
     }
-    activate_with_fallback(attribute, |candidate| {
+    let before = super::renderer_diagnostics::read(&application, instant(deadline)?);
+    let result = activate_with_fallback(attribute, |candidate| {
         if !renderer_probe::attribute_supported(
             &application,
             candidate,
@@ -36,6 +37,16 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
             return Err(not_delivered(AdapterError::not_supported(candidate)));
         }
         enable_attribute(&application, candidate, deadline)
+    });
+    result.map_err(|mut error| {
+        let after =
+            instant(deadline).map(|until| super::renderer_diagnostics::read(&application, until));
+        error.details = Some(serde_json::json!({
+            "activation": error.details,
+            "before": before,
+            "after": after.ok(),
+        }));
+        error
     })
 }
 

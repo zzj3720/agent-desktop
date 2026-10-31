@@ -13,6 +13,7 @@ pub(crate) mod node_read;
 pub(crate) mod node_read_context;
 pub(crate) mod read_error;
 mod traversal;
+mod window_activation;
 
 use crate::tree::AXElement;
 use agent_desktop_core::{
@@ -99,7 +100,10 @@ fn resolve_root(
     match root {
         ObservationRoot::Window(window) => {
             let pid = crate::system::process::process_identity::to_pid_t(window.pid)?;
-            let element = resolve_window_surface(window, request.surface, deadline)?;
+            let element =
+                resolve_window_surface(window, request.surface, deadline).or_else(|error| {
+                    window_activation::request_if_needed(error, window, request.surface, deadline)
+                })?;
             let context =
                 crate::tree::TreeBuildContext::for_pid_with_deadline(pid, true, deadline)?
                     .child_context(window.bounds);
