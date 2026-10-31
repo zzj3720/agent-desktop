@@ -8,8 +8,62 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
     let identity =
         crate::system::process::process_identity::require_core(&process).map_err(not_delivered)?;
     let application = crate::tree::element_for_pid(identity.pid());
+    match activate_element(&application, deadline) {
+        Err(error) if rejected_before_delivery(&error) => {
+            activate_nested(&application, identity.pid(), deadline, error)
+        }
+        result => result,
+    }
+}
+
+fn rejected_before_delivery(error: &AdapterError) -> bool {
+    error.code == ErrorCode::ActionNotSupported
+        && error.disposition == DeliverySemantics::not_delivered()
+}
+
+fn activate_nested(
+    application: &crate::tree::AXElement,
+    pid: i32,
+    deadline: Deadline,
+    mut original: AdapterError,
+) -> Result<(), AdapterError> {
+    let children =
+        crate::tree::surface_read::elements(application, "AXChildren", instant(deadline)?)?;
+    let mut seen = vec![application.clone()];
+    let mut diagnostics = Vec::new();
+    for child in children.into_iter().take(16) {
+        if !crate::tree::element_dedupe::push_unique(&mut seen, child.clone()) {
+            continue;
+        }
+        if crate::tree::properties::ax_ipc::pid(&child, deadline) != Ok(pid)
+            || crate::tree::surface_read::string(&child, "AXRole", instant(deadline)?)?.as_deref()
+                != Some("AXApplication")
+        {
+            continue;
+        }
+        let result = activate_element(&child, deadline);
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if rejected_before_delivery(&error)
+                    || error.code == ErrorCode::PlatformNotSupported =>
+            {
+                diagnostics
+                    .push(serde_json::json!({"message": error.message, "details": error.details}));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    original.details = Some(serde_json::json!({"root": original.details, "nested": diagnostics}));
+    Err(original)
+}
+
+fn activate_element(
+    application: &crate::tree::AXElement,
+    deadline: Deadline,
+) -> Result<(), AdapterError> {
     let attribute = renderer_probe::activation_attribute(
-        &application,
+        application,
         instant(deadline).map_err(not_delivered)?,
     )
     .map_err(not_delivered)?
@@ -19,7 +73,7 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
         ))
     })?;
     let current = crate::tree::surface_read::boolean(
-        &application,
+        application,
         attribute,
         instant(deadline).map_err(not_delivered)?,
     )
@@ -27,20 +81,20 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
     if current == Some(true) {
         return Ok(());
     }
-    let before = super::renderer_diagnostics::read(&application, instant(deadline)?);
+    let before = super::renderer_diagnostics::read(application, instant(deadline)?);
     let result = activate_with_fallback(attribute, |candidate| {
         if !renderer_probe::attribute_supported(
-            &application,
+            application,
             candidate,
             instant(deadline).map_err(not_delivered)?,
         )? {
             return Err(not_delivered(AdapterError::not_supported(candidate)));
         }
-        enable_attribute(&application, candidate, deadline)
+        enable_attribute(application, candidate, deadline)
     });
     result.map_err(|mut error| {
         let after =
-            instant(deadline).map(|until| super::renderer_diagnostics::read(&application, until));
+            instant(deadline).map(|until| super::renderer_diagnostics::read(application, until));
         error.details = Some(serde_json::json!({
             "activation": error.details,
             "before": before,
@@ -163,164 +217,5 @@ fn not_delivered(error: AdapterError) -> AdapterError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn rejected_manual_activation_tries_supported_enhanced_activation() {
-        let mut attempts = Vec::new();
-        activate_with_fallback(renderer_probe::MANUAL, |attribute| {
-            attempts.push(attribute.to_owned());
-            if attribute == renderer_probe::MANUAL {
-                Err(not_delivered(AdapterError::new(
-                    ErrorCode::ActionNotSupported,
-                    attribute,
-                )))
-            } else {
-                Ok(())
-            }
-        })
-        .unwrap();
-        assert_eq!(attempts, [renderer_probe::MANUAL, renderer_probe::ENHANCED]);
-    }
-
-    #[test]
-    fn failed_fallback_keeps_both_diagnostics_and_final_disposition() {
-        let error = activate_with_fallback(renderer_probe::MANUAL, |attribute| {
-            Err(
-                not_delivered(AdapterError::new(ErrorCode::ActionNotSupported, attribute))
-                    .with_details(serde_json::json!({"attribute": attribute})),
-            )
-        })
-        .unwrap_err();
-        let details = error.details.unwrap();
-        assert_eq!(
-            details["manual"]["details"]["attribute"],
-            renderer_probe::MANUAL
-        );
-        assert_eq!(
-            details["enhanced"]["details"]["attribute"],
-            renderer_probe::ENHANCED
-        );
-        assert_eq!(error.disposition, DeliverySemantics::not_delivered());
-    }
-
-    #[test]
-    fn successful_or_uncertain_activation_never_tries_another_attribute() {
-        for outcome in [
-            Ok(()),
-            Err(uncertain(AdapterError::new(
-                ErrorCode::ActionNotSupported,
-                "manual",
-            ))),
-            Err(not_delivered(AdapterError::permission_denied())),
-        ] {
-            let mut attempts = 0;
-            let expected = outcome.as_ref().err().map(|error| error.code.clone());
-            let result = activate_with_fallback(renderer_probe::MANUAL, |_| {
-                attempts += 1;
-                outcome.clone()
-            });
-            assert_eq!(attempts, 1);
-            assert_eq!(result.err().map(|error| error.code), expected);
-        }
-    }
-
-    #[test]
-    fn rejected_enhanced_activation_does_not_cycle_back_to_manual() {
-        let mut attempts = 0;
-        let error = activate_with_fallback(renderer_probe::ENHANCED, |attribute| {
-            attempts += 1;
-            Err(not_delivered(AdapterError::new(
-                ErrorCode::ActionNotSupported,
-                attribute,
-            )))
-        })
-        .unwrap_err();
-        assert_eq!(attempts, 1);
-        assert_eq!(error.code, ErrorCode::ActionNotSupported);
-    }
-
-    #[test]
-    fn observed_activation_overrides_a_setters_not_implemented_response() {
-        let application = crate::tree::AXElement(std::ptr::null_mut());
-        assert!(
-            activation_delivered(
-                &application,
-                renderer_probe::ENHANCED,
-                accessibility_sys::kAXErrorNotImplemented,
-                Some(true),
-            )
-            .unwrap()
-        );
-        assert!(
-            !activation_delivered(
-                &application,
-                renderer_probe::ENHANCED,
-                accessibility_sys::kAXErrorNotImplemented,
-                Some(false),
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn enhanced_activation_with_insufficient_budget_never_touches_native_handle() {
-        let application = crate::tree::AXElement(std::ptr::null_mut());
-        let deadline = Deadline::after(1_000).unwrap();
-        let error = enable_attribute(&application, renderer_probe::ENHANCED, deadline).unwrap_err();
-        assert_eq!(error.code, ErrorCode::Timeout);
-        assert_eq!(error.disposition, DeliverySemantics::not_delivered());
-    }
-
-    #[test]
-    fn reported_success_with_disabled_readback_is_not_activation_success() {
-        let application = crate::tree::AXElement(std::ptr::null_mut());
-        let error = activation_delivered(
-            &application,
-            renderer_probe::ENHANCED,
-            accessibility_sys::kAXErrorSuccess,
-            Some(false),
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::ActionFailed);
-        assert_eq!(error.disposition, DeliverySemantics::delivered_unverified());
-    }
-
-    #[test]
-    fn accepted_manual_write_with_disabled_readback_is_not_an_error() {
-        let application = crate::tree::AXElement(std::ptr::null_mut());
-        assert!(
-            activation_delivered(
-                &application,
-                renderer_probe::MANUAL,
-                accessibility_sys::kAXErrorSuccess,
-                Some(false),
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn missing_readback_keeps_legacy_success_and_preserves_real_failures() {
-        let application = crate::tree::AXElement(std::ptr::null_mut());
-        assert!(
-            activation_delivered(
-                &application,
-                renderer_probe::MANUAL,
-                accessibility_sys::kAXErrorSuccess,
-                None,
-            )
-            .unwrap()
-        );
-        let error = activation_delivered(
-            &application,
-            renderer_probe::ENHANCED,
-            accessibility_sys::kAXErrorCannotComplete,
-            None,
-        )
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::AppUnresponsive);
-        assert_eq!(error.disposition, DeliverySemantics::uncertain());
-    }
-}
+#[path = "renderer_activation_tests.rs"]
+mod tests;
