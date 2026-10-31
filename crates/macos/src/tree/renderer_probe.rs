@@ -64,7 +64,7 @@ fn choose_attribute(
     Ok(None)
 }
 
-fn attribute_supported(
+pub(crate) fn attribute_supported(
     application: &super::AXElement,
     attribute: &str,
     deadline: std::time::Instant,

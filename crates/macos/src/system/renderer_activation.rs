@@ -27,7 +27,39 @@ pub(crate) fn activate(process: ProcessIdentity, deadline: Deadline) -> Result<(
     if current == Some(true) {
         return Ok(());
     }
-    enable_attribute(&application, attribute, deadline)
+    activate_with_fallback(attribute, |candidate| {
+        if !renderer_probe::attribute_supported(
+            &application,
+            candidate,
+            instant(deadline).map_err(not_delivered)?,
+        )? {
+            return Err(not_delivered(AdapterError::not_supported(candidate)));
+        }
+        enable_attribute(&application, candidate, deadline)
+    })
+}
+
+fn activate_with_fallback(
+    attribute: &str,
+    mut enable: impl FnMut(&str) -> Result<(), AdapterError>,
+) -> Result<(), AdapterError> {
+    match enable(attribute) {
+        Err(error)
+            if attribute == renderer_probe::MANUAL
+                && error.code == ErrorCode::ActionNotSupported
+                && error.disposition == DeliverySemantics::not_delivered() =>
+        {
+            enable(renderer_probe::ENHANCED).map_err(|mut enhanced| {
+                let attempts = serde_json::json!({
+                    "manual": {"message": error.message, "details": error.details},
+                    "enhanced": {"message": enhanced.message, "details": enhanced.details},
+                });
+                enhanced.details = Some(attempts);
+                enhanced
+            })
+        }
+        result => result,
+    }
 }
 
 fn enable_attribute(
@@ -64,6 +96,11 @@ fn enable_attribute(
             ErrorCode::ActionNotSupported,
             "Renderer did not enable accessibility activation",
         )
+        .with_details(serde_json::json!({
+            "attribute": attribute_name,
+            "ax_error": error,
+            "readback": readback,
+        }))
         .with_disposition(DeliverySemantics::not_delivered()));
     }
     std::thread::sleep(deadline.remaining().min(settle_delay));
@@ -117,6 +154,81 @@ fn not_delivered(error: AdapterError) -> AdapterError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejected_manual_activation_tries_supported_enhanced_activation() {
+        let mut attempts = Vec::new();
+        activate_with_fallback(renderer_probe::MANUAL, |attribute| {
+            attempts.push(attribute.to_owned());
+            if attribute == renderer_probe::MANUAL {
+                Err(not_delivered(AdapterError::new(
+                    ErrorCode::ActionNotSupported,
+                    attribute,
+                )))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(attempts, [renderer_probe::MANUAL, renderer_probe::ENHANCED]);
+    }
+
+    #[test]
+    fn failed_fallback_keeps_both_diagnostics_and_final_disposition() {
+        let error = activate_with_fallback(renderer_probe::MANUAL, |attribute| {
+            Err(
+                not_delivered(AdapterError::new(ErrorCode::ActionNotSupported, attribute))
+                    .with_details(serde_json::json!({"attribute": attribute})),
+            )
+        })
+        .unwrap_err();
+        let details = error.details.unwrap();
+        assert_eq!(
+            details["manual"]["details"]["attribute"],
+            renderer_probe::MANUAL
+        );
+        assert_eq!(
+            details["enhanced"]["details"]["attribute"],
+            renderer_probe::ENHANCED
+        );
+        assert_eq!(error.disposition, DeliverySemantics::not_delivered());
+    }
+
+    #[test]
+    fn successful_or_uncertain_activation_never_tries_another_attribute() {
+        for outcome in [
+            Ok(()),
+            Err(uncertain(AdapterError::new(
+                ErrorCode::ActionNotSupported,
+                "manual",
+            ))),
+            Err(not_delivered(AdapterError::permission_denied())),
+        ] {
+            let mut attempts = 0;
+            let expected = outcome.as_ref().err().map(|error| error.code.clone());
+            let result = activate_with_fallback(renderer_probe::MANUAL, |_| {
+                attempts += 1;
+                outcome.clone()
+            });
+            assert_eq!(attempts, 1);
+            assert_eq!(result.err().map(|error| error.code), expected);
+        }
+    }
+
+    #[test]
+    fn rejected_enhanced_activation_does_not_cycle_back_to_manual() {
+        let mut attempts = 0;
+        let error = activate_with_fallback(renderer_probe::ENHANCED, |attribute| {
+            attempts += 1;
+            Err(not_delivered(AdapterError::new(
+                ErrorCode::ActionNotSupported,
+                attribute,
+            )))
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 1);
+        assert_eq!(error.code, ErrorCode::ActionNotSupported);
+    }
 
     #[test]
     fn observed_activation_overrides_a_setters_not_implemented_response() {
